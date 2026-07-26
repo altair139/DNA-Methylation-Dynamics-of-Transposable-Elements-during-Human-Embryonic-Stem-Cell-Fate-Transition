@@ -1,0 +1,148 @@
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+library(grid)
+
+# Setup
+outdir <- "/BLUES/eric/ONT_WGBS/Scatter_plot"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+MIN_COV <- 10
+CHR_USE <- "chr10"
+
+# Bin size:
+BIN_WIDTH <- 0.03
+
+# Sample pairs
+sample_pairs <- list(
+  TSC_H9 = list(
+    WGBS = "/BLUES/eric/WGBS/CpG/H9-TSC_onC.methylC.gz",
+    ONT  = "/BLUES/eric/ONT/TSC/TSC_GFP_W3MECP2_merged_aln.methylC.gz"
+  ),
+  TSC_AN = list(
+    WGBS = "/BLUES/eric/WGBS/CpG/AN-TSC_onC.methylC.gz",
+    ONT  = "/BLUES/eric/ONT/TSC/TSC_GFP_W3MECP2_merged_aln.methylC.gz"
+  ),
+  Naive_H9 = list(
+    WGBS = "/BLUES/eric/WGBS/CpG/H9-Naive_onC.methylC.gz",
+    ONT  = "/BLUES/eric/ONT/Naive/091724_Naive_W3MECPC2_aln.methylC.gz"
+  ),
+  Naive_AN = list(
+    WGBS = "/BLUES/eric/WGBS/CpG/AN-Naive_onC.methylC.gz",
+    ONT  = "/BLUES/eric/ONT/Naive/091724_Naive_W3MECPC2_aln.methylC.gz"
+  ),
+  Primed = list(
+    WGBS = "/BLUES/eric/WGBS/CpG/H9-primed_onC.methylC.gz",
+    ONT  = "/BLUES/eric/ONT/Primed/Primed_W3MECP2_aln.methylC.gz"
+  )
+)
+
+#  Main loop 
+for (label in names(sample_pairs)) {
+
+  # Read WGBS methylC.gz
+  wgbs <- fread(
+    cmd = paste("zcat", shQuote(sample_pairs[[label]]$WGBS)),
+    col.names = c("chr","start","end","context","meth_rate","strand","coverage")
+  ) |>
+    filter(chr == CHR_USE, coverage >= MIN_COV, context == "CG") |>
+    as.data.table()
+
+  # Read ONT methylC.gz
+  ont <- fread(
+    cmd = paste("zcat", shQuote(sample_pairs[[label]]$ONT)),
+    col.names = c("chr","start","end","context","meth_rate","strand","coverage")
+  ) |>
+    filter(chr == CHR_USE, coverage >= MIN_COV, context == "CG") |>
+    as.data.table()
+
+  # Use chr:start for exact match
+  wgbs[, key := paste0(chr, ":", start)]
+  ont[,  key := paste0(chr, ":", start)]
+
+  merged <- merge(
+    wgbs[, .(key, meth_rate_WGBS = meth_rate)],
+    ont[,  .(key, meth_rate_ONT  = meth_rate)],
+    by = "key"
+  )
+
+  # Compute Pearson R
+  r_val <- cor(merged$meth_rate_WGBS, merged$meth_rate_ONT, method = "pearson")
+
+  # ---- Binned density plot (2D bins) ----
+  density_plot <- ggplot(merged, aes(x = meth_rate_WGBS, y = meth_rate_ONT)) +
+    geom_bin2d(binwidth = c(BIN_WIDTH, BIN_WIDTH)) +
+    scale_fill_gradientn(
+      colors = c("grey95", "#7b2cbf", "#d00000", "#ffdd00"),
+      values = c(0, 0.55, 0.80, 1),
+      name = "Density",
+      trans = "sqrt"
+    ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+    labs(
+      title = paste0("Methylation Rate: WGBS vs ONT (", label, ", ", CHR_USE, ")"),
+      x = "WGBS Methylation Rate",
+      y = "ONT Methylation Rate"
+    ) +
+    scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid = element_blank(),
+      legend.position = "right",
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+
+  # Extract the density legend (as a grob)
+  dens_legend <- cowplot::get_legend(density_plot)
+
+  # Remove legend from the main plot and place it above the text block
+  density_plot_noleg <- density_plot + theme(legend.position = "none")
+
+  # Metrics text (under density legend) 
+  metrics_lines <- c(
+    paste0("WGBS CpGs : ", formatC(nrow(wgbs),   format = "d", big.mark = ",")),
+    paste0("ONT CpGs  : ", formatC(nrow(ont),    format = "d", big.mark = ",")),
+    paste0("Shared CpGs : ", formatC(nrow(merged), format = "d", big.mark = ",")),
+    paste0("R value : ", formatC(r_val, digits = 3, format = "f")),
+    paste0("Bin width : ", BIN_WIDTH)
+  )
+
+  metrics_plot <- ggplot() +
+    annotate(
+      "text",
+      x = 0, y = 1,
+      label = paste(metrics_lines, collapse = "\n\n"),
+      hjust = 0, vjust = 1,
+      size = 5
+    ) +
+    xlim(0, 1) + ylim(0, 1) +
+    theme_void()
+
+  # Stack: legend on top, metrics below
+  right_panel <- cowplot::plot_grid(
+    dens_legend,
+    metrics_plot,
+    ncol = 1,
+    rel_heights = c(1.1, 2.4)  
+  )
+
+  # Combine main plot + right panel
+  final_plot <- cowplot::plot_grid(
+    density_plot_noleg,
+    right_panel,
+    ncol = 2,
+    rel_widths = c(3.6, 1.4)
+  )
+
+  ggsave(
+    file.path(outdir, paste0("binned_", label, "_", CHR_USE, "_exact_cov", MIN_COV, ".pdf")),
+    final_plot,
+    width = 10, height = 6,
+    device = cairo_pdf,
+    bg = "white"
+  )
+}
